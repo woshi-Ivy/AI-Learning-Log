@@ -74,12 +74,20 @@ class Drone:
         self.simulator = simulator
         self.env = env
         self.identifier = node_id
-        self.coords = coords
-        self.start_coords = coords
+        self.coords = coords               #存入当前位置
+        self.start_coords = coords         #存入初始位置
         #def 发奖金(金额):  self.我的奖金 = 金额
-
+        """""
+        Python                                    Math
+        Class                                     集合U  如：高一3班全体学生
+        实例self (self.是成员成员访问运算符)        元素u  如：张三
+        实例属性 e.g: self.coords                 该元素的特征  如：张三的年龄，张三的肌肉含量
+        变量/参数                                 未知数x
+        __init__
+        """
         self.rng_drone = random.Random(self.identifier + self.simulator.seed)
-        #初始化加入随机数，确保实验的可重复性
+        #init外的初始化。初始化加入随机数，确保实验的可重复性
+        #!!!为什么括号里没有rng_drone？实参从外部传进来的要写在括号里，内部自己计算就可以得出的可以不用写在括号里
 
         self.direction = self.rng_drone.uniform(0, 2 * np.pi)
         self.pitch = self.rng_drone.uniform(-0.05, 0.05)
