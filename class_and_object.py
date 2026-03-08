@@ -6,6 +6,11 @@ class Phone:     #“给定制作手机需要提供的信息模板
         self.number = number
         self.is_waterproof = is_waterproof
 
+""""
+实例属性：self.os = os   初始化的是实例属性
+os：形参
+ios：实参
+"""
 phone1 = Phone("ios",123,True)     #类似于”给定信息，工厂制作中）
 print(phone1.os)   #.可理解为“的”
 pprint(vars(phone1))   #打印全体变量的另一种更为美观的方法。输出变量的呈现按照字母顺序排序而非定义
