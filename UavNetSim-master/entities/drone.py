@@ -89,46 +89,71 @@ class Drone:
         #init外的初始化。初始化加入随机数，确保实验的可重复性
         #!!!为什么括号里没有rng_drone？实参从外部传进来的要写在括号里，内部自己计算就可以得出的可以不用写在括号里
 
-        self.direction = self.rng_drone.uniform(0, 2 * np.pi)
-        self.pitch = self.rng_drone.uniform(-0.05, 0.05)
-        self.speed = speed  # constant speed throughout the simulation
-        self.velocity = [self.speed * math.cos(self.direction) * math.cos(self.pitch),
-                         self.speed * math.sin(self.direction) * math.cos(self.pitch),
-                         self.speed * math.sin(self.pitch)]
-        #self.velocity是个矩阵列表
+        self.direction = self.rng_drone.uniform(0, 2 * np.pi)    #调用NumPy 库里的pi
+        self.pitch = self.rng_drone.uniform(-0.05, 0.05)         
+        """"为什么要self.rng_drone.？
+        python里，由于指针的存在，随机抽样约等于不放回的。为了相互独立互不影响，需要对每个无人机进行单独随机抽样
+        使得共享指针变为独立指针
+        如果是共享指针就会出现：飞机1抽走了0.123，飞机二就抽不到0.123
+        """
+        self.speed = speed  # constant speed throughout the simulation  速率恒定，意味着无人机引擎提供的推力大小保持一致。
+        self.velocity = [self.speed * math.cos(self.direction) * math.cos(self.pitch),   #Vx
+                         self.speed * math.sin(self.direction) * math.cos(self.pitch),   #Vy
+                         self.speed * math.sin(self.pitch)]                              #Vz
+        #self.velocity是个矩阵列表 v=[Vx,Vy,Vz]
         self.direction_mean = self.direction
         self.pitch_mean = self.pitch
         self.velocity_mean = self.speed
+        #在后续飞行中，无人机会左右晃动（波动），但它需要记住它“本来”想往哪个方向飞。mean 就是它的航向参考基准。
 
         self.inbox = inbox
 
-        self.buffer = simpy.Resource(env, capacity=1)
-        self.max_queue_size = config.MAX_QUEUE_SIZE
-        self.transmitting_queue = queue.Queue()  # queue in the real sense
-        self.waiting_list = []
+        self.buffer = simpy.Resource(env, capacity=1)    
+        #信息通道设置为1，同一时刻仅一个飞机可以发出/接收信号。模拟竞争和排队
+        #buffer：排队缓冲等待发送信号
+        self.max_queue_size = config.MAX_QUEUE_SIZE  #从 config 文件读进来的常量，定义了这架飞机“内存”的上限
+        self.transmitting_queue = queue.Queue()  
+        # 存的是准备发送的数据包，先产生的信号先发出，先收到的信号先执行。Queue 对象的本质定义就是 FIFO（First-In-First-Out）。
+        self.waiting_list = []   #尚未进入正式发送排队队列的数据
+        """""
+        产生数据：无人机把自己的 coords 封成包，通过 transmitting_queue 排队发出去。
+        地面站处理：地面站（或另一个无人机）从网络收到这个包。
+        计算决策：地面站判断：“1号机太偏右了，往左打 5 度。”
+        指令回传：地面站生成一个 指令包，通过网络发回给 1 号机。
+        指令解析：1 号机从 inbox 拿到包，执行 self.direction -= 5 * np.pi / 180。
+        物理变动：在下一次 update 时，velocity 重新计算，无人机完成物理上的转弯。
+        """
 
-        self.mac_protocol = CsmaCa(self)
-        self.mac_process_dict = dict()
-        self.mac_process_finish = dict()
+        self.mac_protocol = CsmaCa(self)    #类似交警，模拟了无线电物理特性——“先听后说”
+        self.mac_process_dict = dict()      #记录已发出
+        self.mac_process_finish = dict()    #记录已完成
         self.mac_process_count = 0
         self.enable_blocking = 1  # enable "stop-and-wait" protocol
+        #具体流程图见“流程图1”
 
-        self.routing_protocol = Dsdv(self.simulator, self)
+        self.routing_protocol = Dsdv(self.simulator, self)   #决定了数据包在空中几个无人机间传递跳跃的路径
 
-        self.mobility_model = GaussMarkov3D(self)
+        self.mobility_model = GaussMarkov3D(self)     #模拟平稳巡航的运动轨迹
         # self.motion_controller = VfMotionController(self)
-
-        self.energy_model = EnergyModel(self)
+        """""
+        随机分布 (Uniform) vs. 高斯-马尔可夫 (Gauss-Markov)对比详见
+        "D:\Git--Ivy\AI-Learning-Log\UavNetSim-master\Ivy_studynote\随机分布 (Uniform) vs. 高斯-马尔可夫 (Gauss-Markov).pdf"
+        """
+        self.energy_model = EnergyModel(self)    #EnergyModel：能量模型。它会计算：飞 1 秒扣多少电？发一个包扣多少电？
         self.residual_energy = config.INITIAL_ENERGY
-        self.sleep = False
+        self.sleep = False    #默认为 False。如果电量耗尽，这个状态变 True
 
         self.channel_assigner = ChannelAssigner(self.simulator, self)
+        #ChannelAssigner：信道分配器。如果空域中有多个频率，它负责告诉无人机：
+        # “你去用 1 号频道，他去用 2 号频道”，以减少干扰。
+        #channel是指有多少条马路，capacity=1指的一条马路同一时间下只能有一条信息传递
 
-        self.env.process(self.generate_data_packet())
-        self.env.process(self.feed_packet())
-        self.env.process(self.receive())
+        self.env.process(self.generate_data_packet())   #启动“产生数据”进程。这架飞机会按照一定的频率（比如每秒 1 个）源源不断地产生坐标包或业务包
+        self.env.process(self.feed_packet())    #启动“喂包（处理）”进程。它会不停地检查 transmitting_queue，一旦里面有东西，就去敲 CsmaCa 的门请求发送
+        self.env.process(self.receive())    #启动“监听接收”进程。这架飞机会一直守着自己的天线，一旦有信号飞过来，就把它抓进 inbox 供以后解析
 
-    def generate_data_packet(self, traffic_pattern='Poisson'):
+    def generate_data_packet(self, traffic_pattern='Poisson'):  #Possion是形参默认值
+        #无人机通信默认为泊松分布：你像个正常人，有时候半天不说话，有时候突然连发五六条。这种“突发性、随机性”的消息产生方式，就是泊松分布。
         """
         Generate one data packet, it should be noted that only when the current packet has been sent can the next
         packet be started. When the drone generates a data packet, it will first put it into the "transmitting_queue",
@@ -136,42 +161,71 @@ class Drone:
 
         Parameters:
             traffic_pattern: characterize the time interval between generating data packets
+        通过分析 generate_data_packet 的逻辑，我理解了系统是如何通过 transmitting_queue 
+        实现流量平滑(Traffic Shaping)的。这种‘生产’与‘发送’分离的机制，
+        使我们能够定量地分析在非平稳随机流（如泊松流）冲击下，
+        无人机的端到端时延(End-to-End Latency)。
+        这对于低空飞行中实时控制指令的有效性评估具有决定性意义。
         """
 
-        while True:
-            if not self.sleep:
+        while True:   #构成（死）循环，以下程序并非一次性任务
+         """""
+         在任何 Python 代码中，while 后面的表达式只要为“真”，循环就会执行。
+         由于 True 永远为真，所以这是一个永不停止的循环。
+         它的唯一出口： 只有遇到 break、return、yeild或者抛出异常时，循环才会停止。
+         如果你在一段普通代码里写 while True 而没有退出条件，你的电脑 CPU 会瞬间飙升到 100%，程序会“卡死”。
+         """
+         if not self.sleep:   #还有电
+                #准备发包的物理时长
                 if traffic_pattern == 'Uniform':
                     # the drone generates a data packet every 0.5s with jitter
-                    yield self.env.timeout(self.rng_drone.randint(500000, 505000))
+                    yield self.env.timeout(self.rng_drone.randint(500000, 505000))  
+                    #randint 是 Random Integer 的缩写，意思是“随机整数”
+                    # 语法： randint(a, b) 会从 [a, b] 这个闭区间内，随机挑一个整数
+                    # 出处： 它来自 Python 自带的 random 模块
+                    #额外封装self.rng_drone.用以保证每架无人机的独立性
+                    #yield self.env.timeout：进程延迟，即暂停多少秒
                 elif traffic_pattern == 'Poisson':
                     """
                     The process of generating data packets by nodes follows Poisson distribution, thus the generation 
                     interval of data packets follows exponential distribution
+                    翻译：节点（无人机）生成数据包的过程服从泊松分布，因此，数据包生成的时间间隔服从指数分布。
+                    泊松分布 (Poisson Distribution)： 描述的是在一段固定时间内，事件发生了多少次（比如 1 秒内发了 5 个包）。
+                    指数分布 (Exponential Distribution)： 描述的是两次事件之间经过了多长时间（比如 发完第一个包，要等多久才发第二个包）。
+                    在仿真中，我们无法预知未来 1 秒发多少包，我们只能控制“下一次发包要等多久”。所以，代码里使用的是指数分布。
                     """
 
-                    rate = 5  # on average, how many packets are generated in 1s
-                    yield self.env.timeout(round(self.rng_drone.expovariate(rate) * 1e6))
+                    rate = 5  # on average, how many packets are generated in 1s  $\lambda$。意味着平均每秒发 5 个包。
+                    yield self.env.timeout(round(self.rng_drone.expovariate(rate) * 1e6))  #*1e6用于将秒转化为无人机物理执行层（仿真器）的微秒
+                    #random库中明确：expovariate(lambd) 用于生成指数分布。
+                    #round用于取整。微秒必须是整数时间步。
 
-                config.GL_ID_DATA_PACKET += 1  # data packet id
+                #数据包已准备好，记录好id
+                config.GL_ID_DATA_PACKET += 1  # data packet id  每完成一次上述的timeout就数据包编号+1（数据包记录员），用于追踪数据流
+                #用的是global全局变量而非实体变量，不会出现id重合
 
                 # randomly choose a destination
-                all_candidate_list = [i for i in range(config.NUMBER_OF_DRONES)]
-                all_candidate_list.remove(self.identifier)
-                dst_id = self.rng_drone.choice(all_candidate_list)
-                destination = self.simulator.drones[dst_id]  # obtain the destination drone
+                all_candidate_list = [i for i in range(config.NUMBER_OF_DRONES)]   #创建全集 U = {0, 1, 2, ..., n-1\}，其中n是无人机的总数。
+                all_candidate_list.remove(self.identifier)   #从清单中删掉“我（当前这架无人机）”的 ID，构成所有数据包潜在接收者的补集
+                dst_id = self.rng_drone.choice(all_candidate_list)         #从刚才那个“非我”清单中，随机抽取一个 ID。
+                destination = self.simulator.drones[dst_id]  # obtain the destination drone  根据编号找机器
 
                 # data packet length
                 if config.VARIABLE_PAYLOAD_LENGTH:
+                #if config.VARIABLE_PAYLOAD_LENGTH: 等同于 if config.VARIABLE_PAYLOAD_LENGTH == True:对错在config文件中已设置
+                #1为True，0为False。判断数据包容量是否可变，可在config中调整
+
                     fluctuation = self.rng_drone.randint(-config.MAXIMUM_PAYLOAD_VARIATION, config.MAXIMUM_PAYLOAD_VARIATION)
                     payload_length = config.AVERAGE_PAYLOAD_LENGTH + fluctuation
                 else:
-                    payload_length = config.AVERAGE_PAYLOAD_LENGTH  # in bit, 1024 bytes
+                    payload_length = config.AVERAGE_PAYLOAD_LENGTH  # in bit, 1024 bytes  容量不可变为定值，不考虑波动
 
                 data_packet_length = (config.IP_HEADER_LENGTH + config.MAC_HEADER_LENGTH +
                                       config.PHY_HEADER_LENGTH + payload_length)
-
+                #另外三成包装也消耗容量：网络层的包装：源IP地址和目的IP地址（收寄件地址）+数据链路层的包装：Medium Access Control Header地址（通行证）+物理层最外层的包装
+ 
                 # channel assignment
-                channel_id = self.channel_assigner.channel_assign()
+                channel_id = self.channel_assigner.channel_assign()   #self.channel_assigner用channel_assign方法分发信道资源，并记为channel_id
 
                 pkd = DataPacket(self,
                                  dst_drone=destination,
@@ -180,37 +234,43 @@ class Drone:
                                  data_packet_length=data_packet_length,
                                  simulator=self.simulator,
                                  channel_id=channel_id)
-                pkd.transmission_mode = 0  # the default transmission mode of data packet is "unicast" (0)
+                pkd.transmission_mode = 0  # the default transmission mode of data packet is "unicast" (0) 追加属性，0表示只有特定无人机可接受到信号而不是大喇叭
+                #构造函数DataPacket()调用DataPacket类来创建一个数据包实例pkd
 
-                self.simulator.metrics.datapacket_generated_num += 1
+                self.simulator.metrics.datapacket_generated_num += 1   #加的就是刚刚创建的pkd
 
                 logger.info('At time: %s (us) ++++ UAV: %s generates a data packet (id: %s, dst: %s)',
                             self.env.now, self.identifier, pkd.packet_id, destination.identifier)
+                #日志文件打印信息，包含了当前仿真时间（self.env.now）、发送者 ID、数据包 ID 和目的地 ID。
 
-                pkd.waiting_start_time = self.env.now
+                pkd.waiting_start_time = self.env.now #增加一个属性，记录它开始排队的时间
+                #排队时延（Queuing Delay） = 实际发出时间 - waiting_start_time$$
 
-                if self.transmitting_queue.qsize() < self.max_queue_size:
-                    self.transmitting_queue.put(pkd)
+                if self.transmitting_queue.qsize() < self.max_queue_size:   #检查当前“发送队列”（排队缓冲区）里的包裹数量是否还没达到上限
+                    self.transmitting_queue.put(pkd)   #如果还有空位，就把 pkd 实例放进队列里。FIFO
                 else:
                     # the drone has no more room for new packets
-                    pass
-            else:  # cannot generate packets if "my_drone" is in sleep state
-                break
-
-    def blocking(self):
+                    pass   #什么也不做，丢包
+         else:  # 此处与 if not self.sleep 对齐
+              break  
+         
+    def blocking(self):    #定义名为blocking的方法，返回一个“布尔值”（True 或 False），告诉无人机现在是否处于被阻塞的状态。
         """
+        队头阻塞问题
         The process of waiting for an ACK will block subsequent incoming data packets to simulate the
         "head-of-line blocking problem"
         """
 
-        if self.enable_blocking:
-            if not self.mac_protocol.wait_ack_process_finish:
+        if self.enable_blocking:   #检查配置中是否开启了“阻塞机制”。
+            if not self.mac_protocol.wait_ack_process_finish:   #检查 mac_protocol（MAC协议层）里记录“等待确认进程”的字典/列表是否为空。
+                                                                #如果根本没有正在等待的 ACK 进程，说明路是通的，flag = False。
+
                 flag = False  # there is currently no waiting process for ACK
             else:
                 # get the latest process status
-                final_indicator = list(self.mac_protocol.wait_ack_process_finish.items())[-1]
+                final_indicator = list(self.mac_protocol.wait_ack_process_finish.items())[-1]  #如果有等待记录，取最新（最后一次）的等待进程状态。
 
-                if final_indicator[1] == 0:
+                if final_indicator[1] == 0:     #最新的状态指示符等于 0，表示“正在等待”
                     flag = True  # indicates that the drone is still waiting
                 else:
                     flag = False  # there is currently no waiting process for ACK
